@@ -1106,7 +1106,7 @@ class NeuralForecast:
             test_size = h + step_size * (n_windows - 1)
         elif n_windows is None:
             if (test_size - h) % step_size:
-                raise Exception("`test_size - h` should be module `step_size`")
+                raise Exception("`test_size - h` must be divisible by `step_size`")
             n_windows = int((test_size - h) / step_size) + 1
         else:
             raise Exception("you must define `n_windows` or `test_size` but not both")
