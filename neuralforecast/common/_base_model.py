@@ -1,10 +1,8 @@
-
-
-
-__all__ = ['DistributedConfig', 'BaseModel']
+__all__ = ["DistributedConfig", "BaseModel"]
 
 
 import inspect
+import math
 import random
 import warnings
 from contextlib import contextmanager
@@ -21,6 +19,7 @@ import torch.nn.functional as F
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 
 import neuralforecast.losses.pytorch as losses
+from neuralforecast.common.enums import ExplainerEnum
 from neuralforecast.tsdataset import (
     BaseTimeSeriesDataset,
     TimeSeriesDataModule,
@@ -29,6 +28,17 @@ from neuralforecast.tsdataset import (
 
 from ..losses.pytorch import BasePointLoss, DistributionLoss
 from ..utils import get_indexer_raise_missing
+
+DISTRIBUTION_LOSSES = (
+    losses.DistributionLoss,
+    losses.PMM,
+    losses.GMM,
+    losses.NBMM,
+)
+MULTIQUANTILE_LOSSES = (
+    losses.MQLoss,
+    losses.HuberMQLoss,
+)
 from ._scalers import TemporalNorm
 
 
@@ -133,6 +143,7 @@ class BaseModel(pl.LightningModule):
         if not self.MULTIVARIATE:
             n_series = 1
         self.n_series = n_series
+        self.n_predicts = 1
 
         # Protections for previous recurrent models
         if input_size < 1:
@@ -310,6 +321,7 @@ class BaseModel(pl.LightningModule):
         self.input_size = input_size
         self.windows_batch_size = windows_batch_size
         self.start_padding_enabled = start_padding_enabled
+        self.predict_horizon = self.horizon_backup  # Used in recurrent prediction whereby predict h > h_train
 
         # Padder to complete train windows,
         # example y=[1,2,3,4,5] h=3 -> last y_output = [5,0,0]
@@ -863,6 +875,11 @@ class BaseModel(pl.LightningModule):
         # Broadcasts scale if necessary and inverts normalization
         add_channel_dim = y_hat.ndim > 3
         y_loc, y_scale = self._get_loc_scale(y_idx, add_channel_dim=add_channel_dim)
+        if hasattr(self, "explain") and self.explain and y_hat.shape[0] != y_loc.shape[0]:
+            # n_repeats is always a multiple of the batch size
+            n_repeats = y_hat.shape[0] // y_loc.shape[0]
+            y_loc = y_loc.repeat(n_repeats, *([1] * (y_loc.ndim - 1)))
+            y_scale = y_scale.repeat(n_repeats, *([1] * (y_scale.ndim - 1)))
         y_hat = self.scaler.inverse_transform(z=y_hat, x_scale=y_scale, x_shift=y_loc)
 
         return y_hat
@@ -1124,7 +1141,7 @@ class BaseModel(pl.LightningModule):
         # Initialize results array
         n_outputs = len(self.loss.output_names)
         y_hat = torch.zeros(
-            (insample_y.shape[0], self.horizon_backup, self.n_series, n_outputs),
+            (insample_y.shape[0], self.predict_horizon, self.n_series, n_outputs),
             device=insample_y.device,
             dtype=insample_y.dtype,
         )
@@ -1152,7 +1169,7 @@ class BaseModel(pl.LightningModule):
         )
 
         # Horizon prediction recursively
-        for tau in range(1, self.horizon_backup):
+        for tau in range(1, self.predict_horizon):
             # Set exogenous
             if self.hist_exog_size > 0:
                 hist_exog_current = hist_exog[:, self.input_size + tau - 1].unsqueeze(1)
@@ -1241,12 +1258,12 @@ class BaseModel(pl.LightningModule):
         self, insample_y, insample_mask, hist_exog, futr_exog, stat_exog, y_idx
     ):
         windows_batch = dict(
-            insample_y=insample_y,  # [Ws, L, n_series]
-            insample_mask=insample_mask,  # [Ws, L, n_series]
-            futr_exog=futr_exog,  # univariate: [Ws, L, F]; multivariate: [Ws, F, L, n_series]
-            hist_exog=hist_exog,  # univariate: [Ws, L, X]; multivariate: [Ws, X, L, n_series]
+            insample_y=insample_y,
+            insample_mask=insample_mask,
+            futr_exog=futr_exog,
+            hist_exog=hist_exog,
             stat_exog=stat_exog,
-        )  # univariate: [Ws, S]; multivariate: [n_series, S]
+        )
 
         # Model Predictions
         output_batch = self(windows_batch)
@@ -1255,12 +1272,14 @@ class BaseModel(pl.LightningModule):
         # Inverse normalization and sampling
         if self.loss.is_distribution_output:
             y_loc, y_scale = self._get_loc_scale(y_idx)
+            # Always compute distribution args (needed for both explain and normal mode)
             distr_args = self.loss.scale_decouple(
                 output=output_batch, loc=y_loc, scale=y_scale
             )
+            # Normal mode: full distribution processing with sampling
             _, sample_mean, quants = self.loss.sample(distr_args=distr_args)
             y_hat = torch.concat((sample_mean, quants), axis=-1)
-
+            
             if self.loss.return_params:
                 distr_args = torch.stack(distr_args, dim=-1)
                 if distr_args.ndim > 4:
@@ -1270,6 +1289,278 @@ class BaseModel(pl.LightningModule):
             y_hat = self._inv_normalization(y_hat=output_batch, y_idx=y_idx)
 
         return y_hat
+
+    def _predict_step_recurrent(self, batch, batch_idx):
+        self.input_size = self.inference_input_size
+        temporal_cols = batch["temporal_cols"]
+        windows_temporal, static, static_cols = self._create_windows(
+            batch, step="predict"
+        )
+        n_windows = len(windows_temporal)
+        y_idx = batch["y_idx"]
+
+        # Number of windows in batch
+        windows_batch_size = self.inference_windows_batch_size
+        if windows_batch_size < 0:
+            windows_batch_size = n_windows
+        n_batches = int(np.ceil(n_windows / windows_batch_size))
+        y_hats = []
+
+        if hasattr(self, "explain") and self.explain:
+            insample_explanations = []
+            futr_exog_explanations = []
+            hist_exog_explanations = []
+            stat_exog_explanations = []
+            baseline_predictions = []
+
+        for i in range(n_batches):
+            # Create and normalize windows [Ws, L+H, C]
+            w_idxs = np.arange(
+                i * windows_batch_size, min((i + 1) * windows_batch_size, n_windows)
+            )
+            windows = self._sample_windows(
+                windows_temporal,
+                static,
+                static_cols,
+                temporal_cols,
+                step="predict",
+                w_idxs=w_idxs,
+            )
+            windows = self._normalization(windows=windows, y_idx=y_idx)
+
+            # Parse windows
+            insample_y, insample_mask, _, _, hist_exog, futr_exog, stat_exog = (
+                self._parse_windows(batch, windows)
+            )
+
+            y_hat = self._predict_step_recurrent_batch(
+                insample_y=insample_y,
+                insample_mask=insample_mask,
+                futr_exog=futr_exog,
+                hist_exog=hist_exog,
+                stat_exog=stat_exog,
+                y_idx=y_idx,
+            )
+
+            if hasattr(self, "explain") and self.explain:
+                (
+                    insample_explanation,
+                    futr_exog_explanation,
+                    hist_exog_explanation,
+                    stat_exog_explanation,
+                    baseline_prediction,
+                ) = self._explain_batch(
+                    insample_y=insample_y,
+                    insample_mask=insample_mask,
+                    futr_exog=futr_exog,
+                    hist_exog=hist_exog,
+                    stat_exog=stat_exog,
+                    y_idx=y_idx,
+                    y_hat_shape=y_hat.shape,
+                )
+                insample_explanations.append(insample_explanation)
+                if futr_exog_explanation is not None:
+                    futr_exog_explanations.append(futr_exog_explanation)
+                if hist_exog_explanation is not None:
+                    hist_exog_explanations.append(hist_exog_explanation)
+                if stat_exog_explanation is not None:
+                    stat_exog_explanations.append(stat_exog_explanation)
+                baseline_predictions.append(baseline_prediction)
+
+            y_hats.append(y_hat)
+        y_hat = torch.cat(y_hats, dim=0)
+        self.input_size = self.input_size_backup
+
+        if hasattr(self, "explain") and self.explain:
+            insample_explanations = torch.cat(insample_explanations, dim=0)
+            if futr_exog_explanations:
+                futr_exog_explanations = torch.cat(futr_exog_explanations, dim=0)
+            if hist_exog_explanations:
+                hist_exog_explanations = torch.cat(hist_exog_explanations, dim=0)
+            if stat_exog_explanations:
+                stat_exog_explanations = torch.cat(stat_exog_explanations, dim=0)
+            if baseline_predictions and baseline_predictions[0] is not None:
+                baseline_predictions = torch.cat(baseline_predictions, dim=0)
+            else:
+                baseline_predictions = None
+            return (
+                y_hat,
+                insample_explanations,
+                futr_exog_explanations,
+                hist_exog_explanations,
+                stat_exog_explanations,
+                baseline_predictions,
+            )        
+        else:
+            return y_hat
+
+    def _predict_step_direct(
+        self, batch, batch_idx, recursive=False, trim_window_size=0
+    ):
+        temporal_cols = batch["temporal_cols"]
+        if recursive:
+            # We need to predict recursively, so we use the median quantile if it exists to feed back as insample_y
+            median_idx = self._maybe_get_quantile_idx(quantile=0.5)
+            y_idx = batch["y_idx"]
+            y_hats = []
+            total_test_size = self.test_size
+            remainder = self.test_size % self.h
+
+            cutoff = -total_test_size + self.h
+            futr_temporal = batch["temporal"][:, :, cutoff:]
+            if remainder > 0:
+                # to handle edge case: our original design assumes that prediction is based on fitted horizon (h)
+                # if predict's h argument is not multiple of fitted horizon, the change in array will introduce
+                # side-effect. This ensures that future_temporal has forecast zone to be multiple of h.
+                padded_zeroes = torch.zeros(
+                    [futr_temporal.shape[0], futr_temporal.shape[1], remainder], device=futr_temporal.device
+                )
+                futr_temporal = torch.cat([futr_temporal, padded_zeroes], dim=-1)
+
+            batch["temporal"] = batch["temporal"][:, :, :cutoff]
+            # _create_windows() in next iteration with recursive=False depends on self.test_size
+            self.test_size = self.h
+            for i in range(self.n_predicts):
+                y_hat = self._predict_step_direct(batch, batch_idx, recursive=False)
+
+                y_hats.append(y_hat)
+                y_hat_median = y_hat
+                if median_idx is not None:
+                    y_hat_median = y_hat[..., median_idx]
+                if i < self.n_predicts - 1:
+                    # Update temporal of the batch with predictions
+                    temporal = batch["temporal"]
+                    if self.MULTIVARIATE:
+                        y_hat_median = y_hat_median.swapaxes(0, 2)
+                        y_hat_median = y_hat_median.swapaxes(1, 2)
+                        y_hat_median = y_hat_median.squeeze(1)
+                    else:
+                        y_hat_median = y_hat_median.squeeze(-1)
+
+                    temporal[:, y_idx, -self.h :] = y_hat_median
+
+                    # Concatenate next futr_temporal
+                    idx = i * self.h
+                    next_futr_temporal = futr_temporal[:, :, idx : idx + self.h]
+                    temporal = torch.cat((temporal, next_futr_temporal), dim=-1)
+
+                    # Update batch
+                    batch["temporal"] = temporal
+
+            y_hat = torch.cat(y_hats, dim=1)
+            self.test_size = total_test_size
+        else:
+            windows_temporal, static, static_cols = self._create_windows(
+                batch,
+                step="predict",
+            )
+            n_windows = len(windows_temporal)
+            y_idx = batch["y_idx"]
+
+            # Number of windows in batch
+            windows_batch_size = self.inference_windows_batch_size
+            if windows_batch_size < 0:
+                windows_batch_size = n_windows
+            n_batches = int(np.ceil(n_windows / windows_batch_size))
+            y_hats = []
+
+
+            if hasattr(self, "explain") and self.explain:
+                insample_explanations = []
+                futr_exog_explanations = []
+                hist_exog_explanations = []
+                stat_exog_explanations = []
+                baseline_predictions = []
+
+            for i in range(n_batches):
+                # Create and normalize windows [Ws, L+H, C]
+                w_idxs = np.arange(
+                    i * windows_batch_size, min((i + 1) * windows_batch_size, n_windows)
+                )
+                windows = self._sample_windows(
+                    windows_temporal,
+                    static,
+                    static_cols,
+                    temporal_cols,
+                    step="predict",
+                    w_idxs=w_idxs,
+                )
+                windows = self._normalization(windows=windows, y_idx=y_idx)
+
+                # Parse windows
+                insample_y, insample_mask, _, _, hist_exog, futr_exog, stat_exog = (
+                    self._parse_windows(batch, windows)
+                )
+
+                y_hat = self._predict_step_direct_batch(
+                    insample_y=insample_y,
+                    insample_mask=insample_mask,
+                    futr_exog=futr_exog,
+                    hist_exog=hist_exog,
+                    stat_exog=stat_exog,
+                    y_idx=y_idx,
+                )
+
+                if hasattr(self, "explain") and self.explain:
+                    (
+                        insample_explanation,
+                        futr_exog_explanation,
+                        hist_exog_explanation,
+                        stat_exog_explanation,
+                        baseline_prediction,
+                    ) = self._explain_batch(
+                        insample_y=insample_y,
+                        insample_mask=insample_mask,
+                        futr_exog=futr_exog,
+                        hist_exog=hist_exog,
+                        stat_exog=stat_exog,
+                        y_idx=y_idx,
+                        y_hat_shape=y_hat.shape,
+                    )
+                    insample_explanations.append(insample_explanation)
+                    if futr_exog_explanation is not None:
+                        futr_exog_explanations.append(futr_exog_explanation)
+                    if hist_exog_explanation is not None:
+                        hist_exog_explanations.append(hist_exog_explanation)
+                    if stat_exog_explanation is not None:
+                        stat_exog_explanations.append(stat_exog_explanation)
+                    baseline_predictions.append(baseline_prediction)
+
+                y_hats.append(y_hat)
+
+            y_hat = torch.cat(y_hats, dim=0)
+            if hasattr(self, "explain") and self.explain:
+                insample_explanations = torch.cat(insample_explanations, dim=0)
+                if futr_exog_explanations:
+                    futr_exog_explanations = torch.cat(futr_exog_explanations, dim=0)
+                if hist_exog_explanations:
+                    hist_exog_explanations = torch.cat(hist_exog_explanations, dim=0)
+                if stat_exog_explanations:
+                    stat_exog_explanations = torch.cat(stat_exog_explanations, dim=0)
+                if baseline_predictions and baseline_predictions[0] is not None:
+                    baseline_predictions = torch.cat(baseline_predictions, dim=0)
+                else:
+                    baseline_predictions = None
+                return (
+                    y_hat,
+                    insample_explanations,
+                    futr_exog_explanations,
+                    hist_exog_explanations,
+                    stat_exog_explanations,
+                    baseline_predictions,
+                )
+
+        return y_hat
+
+    def _maybe_get_quantile_idx(self, quantile: float) -> Union[int, None]:
+        if isinstance(self.loss, DISTRIBUTION_LOSSES + MULTIQUANTILE_LOSSES):
+            try:
+                idx_quantile = (self.loss.quantiles == quantile).nonzero().item()
+                offset = 1 if isinstance(self.loss, DISTRIBUTION_LOSSES) else 0
+                return idx_quantile + offset
+            except:
+                raise ValueError("Model was not trained with a median quantile.")
+        return None
 
     def training_step(self, batch, batch_idx):
         # Set horizon to h_train in case of recurrent model to speed up training
@@ -1446,65 +1737,11 @@ class BaseModel(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx):
         if self.RECURRENT:
-            self.input_size = self.inference_input_size
-
-        temporal_cols = batch["temporal_cols"]
-        windows_temporal, static, static_cols = self._create_windows(
-            batch, step="predict"
-        )
-        n_windows = len(windows_temporal)
-        y_idx = batch["y_idx"]
-
-        # Number of windows in batch
-        windows_batch_size = self.inference_windows_batch_size
-        if windows_batch_size < 0:
-            windows_batch_size = n_windows
-        n_batches = int(np.ceil(n_windows / windows_batch_size))
-        y_hats = []
-        for i in range(n_batches):
-            # Create and normalize windows [Ws, L+H, C]
-            w_idxs = np.arange(
-                i * windows_batch_size, min((i + 1) * windows_batch_size, n_windows)
+            return self._predict_step_recurrent(batch, batch_idx)
+        else:
+            return self._predict_step_direct(
+                batch, batch_idx, recursive=self.n_predicts > 1
             )
-            windows = self._sample_windows(
-                windows_temporal,
-                static,
-                static_cols,
-                temporal_cols,
-                step="predict",
-                w_idxs=w_idxs,
-            )
-            windows = self._normalization(windows=windows, y_idx=y_idx)
-
-            # Parse windows
-            insample_y, insample_mask, _, _, hist_exog, futr_exog, stat_exog = (
-                self._parse_windows(batch, windows)
-            )
-
-            if self.RECURRENT:
-                y_hat = self._predict_step_recurrent_batch(
-                    insample_y=insample_y,
-                    insample_mask=insample_mask,
-                    futr_exog=futr_exog,
-                    hist_exog=hist_exog,
-                    stat_exog=stat_exog,
-                    y_idx=y_idx,
-                )
-            else:
-                y_hat = self._predict_step_direct_batch(
-                    insample_y=insample_y,
-                    insample_mask=insample_mask,
-                    futr_exog=futr_exog,
-                    hist_exog=hist_exog,
-                    stat_exog=stat_exog,
-                    y_idx=y_idx,
-                )
-
-            y_hats.append(y_hat)
-        y_hat = torch.cat(y_hats, dim=0)
-        self.input_size = self.input_size_backup
-
-        return y_hat
 
     def fit(
         self,
@@ -1530,7 +1767,7 @@ class BaseModel(pl.LightningModule):
         disk memory, to get them change `enable_checkpointing=True` in `__init__`.
 
         Args:
-            dataset (TimeSeriesDataset): NeuralForecast's `TimeSeriesDataset`, see [documentation](https://nixtla.github.io/neuralforecast/tsdataset.html).
+            dataset (TimeSeriesDataset): NeuralForecast's `TimeSeriesDataset`, see [documentation](./tsdataset).
             val_size (int): Validation size for temporal cross-validation.
             random_seed (int): Random seed for pytorch initializer and numpy generators, overwrites model.__init__'s.
             test_size (int): Test size for temporal cross-validation.
@@ -1555,6 +1792,8 @@ class BaseModel(pl.LightningModule):
         step_size=1,
         random_seed=None,
         quantiles=None,
+        h=None,
+        explainer_config=None,
         **data_module_kwargs,
     ):
         """Predict.
@@ -1562,16 +1801,22 @@ class BaseModel(pl.LightningModule):
         Neural network prediction with PL's `Trainer` execution of `predict_step`.
 
         Args:
-            dataset (TimeSeriesDataset): NeuralForecast's `TimeSeriesDataset`, see [documentation](https://nixtla.github.io/neuralforecast/tsdataset.html).
+            dataset (TimeSeriesDataset): NeuralForecast's `TimeSeriesDataset`, see [documentation](./tsdataset).
             test_size (int): Test size for temporal cross-validation.
             step_size (int): Step size between each window.
             random_seed (int): Random seed for pytorch initializer and numpy generators, overwrites model.__init__'s.
             quantiles (list): Target quantiles to predict.
+            h (int): Prediction horizon, if None, uses the model's fitted horizon. Defaults to None.
+            explainer_config (dict): configuration for explanations.
             **data_module_kwargs (dict): PL's TimeSeriesDataModule args, see [documentation](https://pytorch-lightning.readthedocs.io/en/1.6.1/extensions/datamodules.html#using-a-datamodule).
 
         Returns:
             None
         """
+        if h is not None and h > self.horizon_backup and explainer_config is not None:
+            # TODO remove this if the constraint is no longer applicable.
+            raise ValueError("Prediction explanation is not supported for prediction horizon larger than the horizon of the fitted models")
+
         self._check_exog(dataset)
         self._restart_seed(random_seed)
         if "quantile" in data_module_kwargs:
@@ -1585,11 +1830,6 @@ class BaseModel(pl.LightningModule):
 
         self.predict_step_size = step_size
         self.decompose_forecast = False
-        datamodule = TimeSeriesDataModule(
-            dataset=dataset,
-            valid_batch_size=self.valid_batch_size,
-            **data_module_kwargs,
-        )
 
         # Protect when case of multiple gpu. PL does not support return preds with multiple gpu.
         pred_trainer_kwargs = self.trainer_kwargs.copy()
@@ -1599,9 +1839,86 @@ class BaseModel(pl.LightningModule):
             pred_trainer_kwargs["devices"] = [0]
             pred_trainer_kwargs["strategy"] = "auto"
 
-        trainer = pl.Trainer(**pred_trainer_kwargs)
-        fcsts = trainer.predict(self, datamodule=datamodule)
-        fcsts = torch.vstack(fcsts)
+        # Determine the number of predictions to make in case h > self.h
+        if h is None:
+            self.predict_horizon = self.horizon_backup
+        else:
+            self.predict_horizon = h
+
+        self.n_predicts = 1
+        if h is not None and h > self.h:
+            if not self.RECURRENT:
+                self.n_predicts = math.ceil(h / self.h)
+                assert (
+                    self.test_size > self.h
+                ), f"Test size should be larger than horizon h={self.h} for direct recursive prediction."
+            else:
+                self.h = h
+
+        datamodule = TimeSeriesDataModule(
+            dataset=dataset,
+            valid_batch_size=self.valid_batch_size,
+            **data_module_kwargs,
+        )
+
+        # We need to re-enable grad for explanations
+        self.explain = explainer_config is not None
+        if self.explain:
+            pred_trainer_kwargs["inference_mode"] = False
+            self.explainer_config = explainer_config
+            trainer = pl.Trainer(**pred_trainer_kwargs)
+            out = trainer.predict(self, datamodule=datamodule)
+            fcsts = []
+            insample_explanations = []
+            futr_exog_explanations = []
+            hist_exog_explanations = []
+            stat_exog_explanations = []
+            baseline_predictions = []
+            for tensors in out:
+                (
+                    fcst,
+                    insample_explanation,
+                    futr_exog_explanation,
+                    hist_exog_explanation,
+                    stat_exog_explanation,
+                    baseline_prediction
+                ) = tensors
+                fcsts.append(fcst)
+                insample_explanations.append(insample_explanation)
+                if self.futr_exog_list:
+                    futr_exog_explanations.append(futr_exog_explanation)
+                if self.hist_exog_list:
+                    hist_exog_explanations.append(hist_exog_explanation)
+                if self.stat_exog_list:
+                    stat_exog_explanations.append(stat_exog_explanation)
+                baseline_predictions.append(baseline_prediction)
+
+            fcsts = torch.vstack(fcsts)
+            insample_explanations = torch.vstack(insample_explanations)
+            if futr_exog_explanations:
+                futr_exog_explanations = torch.vstack(futr_exog_explanations)
+            if hist_exog_explanations:
+                hist_exog_explanations = torch.vstack(hist_exog_explanations)
+            if stat_exog_explanations:
+                stat_exog_explanations = torch.vstack(stat_exog_explanations)
+            if baseline_predictions and baseline_predictions[0] is not None:
+                baseline_predictions = torch.vstack(baseline_predictions)
+            else:
+                baseline_predictions = None
+            self.explanations = {
+                'insample_explanations': insample_explanations,
+                'futr_exog_explanations': futr_exog_explanations if futr_exog_explanations is not None else None,
+                'hist_exog_explanations': hist_exog_explanations if hist_exog_explanations is not None else None,
+                'stat_exog_explanations': stat_exog_explanations if stat_exog_explanations is not None else None,
+                'baseline_predictions': baseline_predictions
+            }
+        else:
+            trainer = pl.Trainer(**pred_trainer_kwargs)
+            fcsts = trainer.predict(self, datamodule=datamodule)
+            fcsts = torch.vstack(fcsts)
+            self.explanations = None
+            if h is not None:
+                fcsts = fcsts[:, :h]
 
         if self.MULTIVARIATE:
             # [B, h, n_series (, Q)] -> [n_series, B, h (, Q)]
@@ -1610,6 +1927,12 @@ class BaseModel(pl.LightningModule):
 
         fcsts = tensor_to_numpy(fcsts).flatten()
         fcsts = fcsts.reshape(-1, len(self.loss.output_names))
+
+        # Reset n_predicts
+        self.n_predicts = 1
+        self.h = self.horizon_backup
+        self.predict_horizon = self.horizon_backup
+
         return fcsts
 
     def decompose(
@@ -1626,7 +1949,7 @@ class BaseModel(pl.LightningModule):
         Available methods are `ESRNN`, `NHITS`, `NBEATS`, and `NBEATSx`.
 
         Args:
-            dataset (TimeSeriesDataset): NeuralForecast's `TimeSeriesDataset`, see [documentation here](https://nixtla.github.io/neuralforecast/tsdataset.html).
+            dataset (TimeSeriesDataset): NeuralForecast's `TimeSeriesDataset`, see [documentation here](./tsdataset).
             step_size (int): Step size between each window of temporal data.
             random_seed (int): Random seed for pytorch initializer and numpy generators, overwrites model.__init__'s.
             quantiles (list): Target quantiles to predict.
@@ -1653,3 +1976,223 @@ class BaseModel(pl.LightningModule):
         self.decompose_forecast = False  # Default decomposition back to false
         fcsts = torch.vstack(fcsts)
         return tensor_to_numpy(fcsts)
+    
+    def _predict_step_wrapper(
+        self,
+        insample_y,
+        insample_mask,
+        futr_exog,
+        hist_exog,
+        stat_exog,
+        y_idx,
+        output_horizon,
+        output_series,
+        output_index,
+    ):
+        """Forward pass for tensorized inputs."""
+
+        # Dumb trick to ensure that insample_mask is used to produce the output for calculating explanations.
+        insample_y = insample_y - insample_mask
+        insample_y = insample_y + insample_mask
+        if self.RECURRENT:
+            y_hat = self._predict_step_recurrent_batch(
+                insample_y=insample_y,
+                insample_mask=insample_mask,
+                futr_exog=futr_exog,
+                hist_exog=hist_exog,
+                stat_exog=stat_exog,
+                y_idx=y_idx,
+            )
+        else:
+            y_hat = self._predict_step_direct_batch(
+                insample_y=insample_y,
+                insample_mask=insample_mask,
+                futr_exog=futr_exog,
+                hist_exog=hist_exog,
+                stat_exog=stat_exog,
+                y_idx=y_idx,
+            )
+        if y_hat.ndim == 3:
+            y_hat = y_hat.unsqueeze(-1)  # Add output dimension if needed
+
+        return y_hat[:, output_horizon, output_series, output_index]
+
+    def _explain_batch(
+        self,
+        insample_y,
+        insample_mask,
+        futr_exog,
+        hist_exog,
+        stat_exog,
+        y_idx,
+        y_hat_shape,
+    ):
+
+        # Attribute the input
+        horizons = self.explainer_config.get("horizons", list(range(self.h)))
+        series = list(range(self.n_series))
+        output_index = self.explainer_config.get(
+            "output_index", list(range(y_hat_shape[-1]))
+        )
+
+        # Start with required inputs
+        insample_y.requires_grad_()
+        insample_mask.requires_grad_()
+        input_batch = (insample_y, insample_mask)
+        param_positions = {"insample_y": 0, "insample_mask": 1}
+        add_dim = False
+        if len(y_hat_shape) == 3:
+            y_hat_shape = y_hat_shape + (1,)
+            add_dim = True
+        shape = list(y_hat_shape)
+        shape[1] = len(horizons)
+        shape[3] = len(output_index)            
+        insample_explanations = torch.empty(
+            size=(*shape, insample_y.shape[1], 2),
+            device=insample_y.device,
+            dtype=insample_y.dtype,
+        )
+
+        # Keep track of which parameter is at which position in input_batch
+        pos = 2  # Starting position after insample_y and insample_mask
+
+        # Add optional parameters and track their positions
+        futr_exog_explanations = None
+        if futr_exog is not None:
+            futr_exog.requires_grad_()
+            input_batch = input_batch + (futr_exog,)
+            param_positions["futr_exog"] = pos
+            pos += 1
+            if futr_exog.ndim == 3:
+                futr_exog_explanations = torch.empty(
+                    size=(*shape, futr_exog.shape[1], futr_exog.shape[2]),
+                    device=futr_exog.device,
+                    dtype=futr_exog.dtype,
+                )
+            else:
+                futr_exog_explanations = torch.empty(
+                    size=(*shape, futr_exog.shape[2], futr_exog.shape[1]),
+                    device=futr_exog.device,
+                    dtype=futr_exog.dtype,
+                )
+
+        hist_exog_explanations = None
+        if hist_exog is not None:
+            hist_exog.requires_grad_()
+            input_batch = input_batch + (hist_exog,)
+            param_positions["hist_exog"] = pos
+            pos += 1
+            if hist_exog.ndim == 3:
+                hist_exog_explanations = torch.empty(
+                    size=(*shape, hist_exog.shape[1], hist_exog.shape[2]),
+                    device=hist_exog.device,
+                    dtype=hist_exog.dtype,
+                )
+            else:
+                hist_exog_explanations = torch.empty(
+                    size=(*shape, hist_exog.shape[2], hist_exog.shape[1]),
+                    device=hist_exog.device,
+                    dtype=hist_exog.dtype,
+                )
+
+        stat_exog_explanations = None
+        if stat_exog is not None:
+            stat_exog.requires_grad_()
+            input_batch = input_batch + (stat_exog,)
+            param_positions["stat_exog"] = pos
+            pos += 1
+            stat_exog_explanations = torch.empty(
+                size=(*shape, stat_exog.shape[1]),
+                device=stat_exog.device,
+                dtype=stat_exog.dtype,
+            )
+
+        # Loop over horizons, series and output_indices
+        for i, horizon in enumerate(horizons):
+            for j, series_idx in enumerate(series):
+                for k, output_idx in enumerate(output_index):
+                    forward_fn = lambda *args: self._predict_step_wrapper(
+                        insample_y=args[param_positions["insample_y"]],
+                        insample_mask=args[param_positions["insample_mask"]],
+                        futr_exog=(
+                            args[param_positions["futr_exog"]]
+                            if "futr_exog" in param_positions
+                            else None
+                        ),
+                        hist_exog=(
+                            args[param_positions["hist_exog"]]
+                            if "hist_exog" in param_positions
+                            else None
+                        ),
+                        stat_exog=(
+                            args[param_positions["stat_exog"]]
+                            if "stat_exog" in param_positions
+                            else None
+                        ),
+                        y_idx=y_idx,
+                        output_horizon=horizon,
+                        output_series=series_idx,
+                        output_index=output_idx,
+                    )
+                    attributor = self.explainer_config["explainer"](forward_fn)
+                    attributions = attributor.attribute(
+                        input_batch,
+                    )
+
+                    insample_attr = attributions[0].squeeze(-1)
+                    insample_explanations[:, i, j, k, :, 0] = insample_attr
+
+                    insample_mask_attr = attributions[1].squeeze(-1)
+                    insample_explanations[:, i, j, k, :, 1] = insample_mask_attr
+
+                    if "futr_exog" in param_positions:
+                        futr_exog_attr = attributions[param_positions["futr_exog"]]
+                        futr_exog_explanations[:, i, j, k] = futr_exog_attr
+
+                    if "hist_exog" in param_positions:
+                        hist_exog_attr = attributions[param_positions["hist_exog"]]
+                        hist_exog_explanations[:, i, j, k] = hist_exog_attr
+
+                    if "stat_exog" in param_positions:
+                        stat_exog_attr = attributions[param_positions["stat_exog"]]
+                        stat_exog_explanations[:, i, j, k] = stat_exog_attr
+                     
+
+        explainer_class = self.explainer_config["explainer"]
+        explainer_name = explainer_class.__name__ if hasattr(explainer_class, '__name__') else str(explainer_class)
+        additive_explainers = ExplainerEnum.AdditiveExplainers
+
+        if explainer_name in additive_explainers:
+            if self.RECURRENT:
+                baseline_predictions = self._predict_step_recurrent_batch(
+                    insample_y=insample_y * 0,
+                    insample_mask=insample_mask * 0,
+                    futr_exog=futr_exog * 0 if futr_exog is not None else None,
+                    hist_exog=hist_exog * 0 if hist_exog is not None else None,
+                    stat_exog=stat_exog * 0 if stat_exog is not None else None,
+                    y_idx=y_idx,
+                )                
+            else:
+                baseline_predictions = self._predict_step_direct_batch(
+                    insample_y=insample_y * 0,
+                    insample_mask=insample_mask * 0,
+                    futr_exog=futr_exog * 0 if futr_exog is not None else None,
+                    hist_exog=hist_exog * 0 if hist_exog is not None else None,
+                    stat_exog=stat_exog * 0 if stat_exog is not None else None,
+                    y_idx=y_idx,
+                )
+            if add_dim:
+                baseline_predictions = baseline_predictions.unsqueeze(-1)
+            baseline_predictions = baseline_predictions.index_select(1, torch.tensor(horizons, device=baseline_predictions.device))
+            baseline_predictions = baseline_predictions.index_select(2, torch.tensor(series, device=baseline_predictions.device))
+            baseline_predictions = baseline_predictions.index_select(3, torch.tensor(output_index, device=baseline_predictions.device))
+        else:
+            baseline_predictions = None
+
+        return (
+            insample_explanations,
+            futr_exog_explanations,
+            hist_exog_explanations,
+            stat_exog_explanations,
+            baseline_predictions
+        )

@@ -22,7 +22,7 @@ from coreforecast.scalers import (
 )
 from utilsforecast.compat import DataFrame, DFType, Series, pl_DataFrame, pl_Series
 from utilsforecast.validation import validate_freq
-
+from neuralforecast.common.enums import ExplainerEnum
 from neuralforecast.models import (
     GRU,
     KAN,
@@ -215,6 +215,7 @@ _type2scaler = {
 
 
 class NeuralForecast:
+    models: List[Any]
 
     def __init__(
         self,
@@ -229,7 +230,7 @@ class NeuralForecast:
 
         Args:
             models (List[typing.Any]): Instantiated `neuralforecast.models`
-                see [collection here](https://nixtla.github.io/neuralforecast/models.html).
+                see [collection here](./models).
             freq (str or int): Frequency of the data. Must be a valid pandas or polars offset alias, or an integer.
             local_scaler_type (str, optional): Scaler to apply per-serie to all features before fitting, which is inverted after predicting.
                 Can be 'standard', 'robust', 'robust-iqr', 'minmax' or 'boxcox'. Defaults to None.
@@ -545,7 +546,9 @@ class NeuralForecast:
 
         self._fitted = True
 
-    def make_future_dataframe(self, df: Optional[DFType] = None) -> DFType:
+    def make_future_dataframe(
+        self, df: Optional[DFType] = None, h: Optional[int] = None
+    ) -> DFType:
         """Create a dataframe with all ids and future times in the forecasting horizon.
 
         Args:
@@ -567,17 +570,19 @@ class NeuralForecast:
         else:
             uids = self.uids
             last_times = self.last_dates
+        if h is None:
+            h = self.h
         return ufp.make_future_dataframe(
             uids=uids,
             last_times=last_times,
             freq=self.freq,
-            h=self.h,
+            h=h,
             id_col=self.id_col,
             time_col=self.time_col,
         )
 
     def get_missing_future(
-        self, futr_df: DFType, df: Optional[DFType] = None
+        self, futr_df: DFType, df: Optional[DFType] = None, h: Optional[int] = None
     ) -> DFType:
         """Get the missing ids and times combinations in `futr_df`.
 
@@ -586,7 +591,7 @@ class NeuralForecast:
             df (pandas or polars DataFrame, optional): DataFrame with columns [`unique_id`, `ds`, `y`] and exogenous variables.
                 Only required if this is different than the one used in the fit step. Defaults to None.
         """
-        expected = self.make_future_dataframe(df)
+        expected = self.make_future_dataframe(df, h=h)
         ids = [self.id_col, self.time_col]
         return ufp.anti_join(expected, futr_df[ids], on=ids)
 
@@ -662,6 +667,7 @@ class NeuralForecast:
         static_df: Optional[SparkDataFrame],
         futr_df: Optional[SparkDataFrame],
         engine,
+        h: Optional[int] = None,
     ):
         import fugue.api as fa
 
@@ -674,6 +680,7 @@ class NeuralForecast:
             id_col,
             time_col,
             target_col,
+            h,
         ) -> pd.DataFrame:
             from neuralforecast import NeuralForecast
 
@@ -701,7 +708,7 @@ class NeuralForecast:
                 df = df.drop(columns=static_cols)
             else:
                 static_df = None
-            return nf.predict(df=df, static_df=static_df, futr_df=futr_df)
+            return nf.predict(df=df, static_df=static_df, futr_df=futr_df, h=h)
 
         # df
         if isinstance(df, SparkDataFrame):
@@ -765,6 +772,7 @@ class NeuralForecast:
                 id_col=self.id_col,
                 time_col=self.time_col,
                 target_col=self.target_col,
+                h=h,
             ),
         )
 
@@ -777,6 +785,7 @@ class NeuralForecast:
         engine=None,
         level: Optional[List[Union[int, float]]] = None,
         quantiles: Optional[List[float]] = None,
+        h: Optional[int] = None,
         **data_kwargs,
     ):
         """Predict with core.NeuralForecast.
@@ -792,6 +801,7 @@ class NeuralForecast:
             engine (spark session): Distributed engine for inference. Only used if df is a spark dataframe or if fit was called on a spark dataframe.
             level (list of ints or floats, optional): Confidence levels between 0 and 100. Defaults to None.
             quantiles (list of floats, optional): Alternative to level, target quantiles to predict. Defaults to None.
+            h (int, optional): Forecasting horizon. If None, uses the horizon of the fitted models. Defaults to None.
             data_kwargs (kwargs): Extra arguments to be passed to the dataset within each model.
 
         Returns:
@@ -803,6 +813,31 @@ class NeuralForecast:
 
         if not self._fitted:
             raise Exception("You must fit the model before predicting.")
+
+        if h is not None:
+            if h > self.h:
+                # if only cross_validation called without fit() called first, prediction_intervals
+                # attribute is not defined
+                if getattr(self, "prediction_intervals", None) is not None:
+                    raise ValueError(
+                        f"The specified horizon h={h} is larger than the horizon of the fitted models: {self.h}. "
+                        "Forecast with prediction intervals is not supported."
+                    )
+
+                for model in self.models:
+                    if model.hist_exog_list:
+                        raise NotImplementedError(
+                            f"Model {model} has historic exogenous features, "
+                            "which is not compatible with setting a larger horizon during prediction."
+                        )
+            elif h < self.h:
+                raise ValueError(
+                    f"The specified horizon h={h} must be greater than the horizon of the fitted models: {self.h}."
+                )
+            else:
+                h = self.h
+        else:
+            h = self.h
 
         quantiles_ = None
         level_ = None
@@ -846,6 +881,7 @@ class NeuralForecast:
                 static_df=static_df,
                 futr_df=futr_df,
                 engine=engine,
+                h=h,
             )
 
         if is_dataset_local_files and df is None:
@@ -876,7 +912,7 @@ class NeuralForecast:
             uids=uids,
             last_times=last_dates,
             freq=self.freq,
-            h=self.h,
+            h=h,
             id_col=self.id_col,
             time_col=self.time_col,
         )
@@ -889,11 +925,19 @@ class NeuralForecast:
             futr_df = ufp.join(futr_df, fcsts_df, on=[self.id_col, self.time_col])
             if futr_df.shape[0] < fcsts_df.shape[0]:
                 if df is None:
-                    expected_cmd = "make_future_dataframe()"
-                    missing_cmd = "get_missing_future(futr_df)"
+                    if h != self.h:
+                        expected_cmd = f"make_future_dataframe(h={h})"
+                        missing_cmd = f"get_missing_future(futr_df, h={h})"
+                    else:
+                        expected_cmd = "make_future_dataframe()"
+                        missing_cmd = "get_missing_future(futr_df)"
                 else:
-                    expected_cmd = "make_future_dataframe(df)"
-                    missing_cmd = "get_missing_future(futr_df, df)"
+                    if h != self.h:
+                        expected_cmd = f"make_future_dataframe(df, h={h})"
+                        missing_cmd = f"get_missing_future(futr_df, df, h={h})"
+                    else:
+                        expected_cmd = "make_future_dataframe(df)"
+                        missing_cmd = "get_missing_future(futr_df, df)"
                 raise ValueError(
                     "There are missing combinations of ids and times in `futr_df`.\n"
                     f"You can run the `{expected_cmd}` method to get the expected combinations or "
@@ -919,11 +963,12 @@ class NeuralForecast:
             quantiles_=quantiles_,
             level_=level_,
             has_level=has_level,
+            h=h,
             **data_kwargs,
         )
 
         if self.scalers_:
-            indptr = np.append(0, np.full(len(uids), self.h).cumsum())
+            indptr = np.append(0, np.full(len(uids), h).cumsum())
             fcsts = self._scalers_target_inverse_transform(fcsts, indptr)
 
         # Declare predictions pd.DataFrame
@@ -934,6 +979,208 @@ class NeuralForecast:
         fcsts_df = ufp.horizontal_concat([fcsts_df, fcsts])
 
         return fcsts_df
+
+    def explain(
+        self,
+        horizons: Optional[list[int]] = None,
+        outputs: list[int] = [0],
+        explainer: str = ExplainerEnum.IntegratedGradients,
+        df: Optional[Union[DataFrame, SparkDataFrame]] = None,
+        static_df: Optional[Union[DataFrame, SparkDataFrame]] = None,
+        futr_df: Optional[Union[DataFrame, SparkDataFrame]] = None,
+        verbose: bool = True,
+        engine=None,
+        level: Optional[List[Union[int, float]]] = None,
+        quantiles: Optional[List[float]] = None,
+        **data_kwargs,
+    ):
+        """(BETA) - Explain with core.NeuralForecast.
+
+        Use stored fitted `models` to explain large set of time series from DataFrame `df`.
+
+        Args:
+            horizons (list of int, optional): List of horizons to explain. If None, all horizons are explained. Defaults to None.
+            outputs (list of int, optional): List of outputs to explain for models with multiple outputs. Defaults to [0] (first output).
+            explainer (str): Name of the explainer to use. Options are 'IntegratedGradients', 'ShapleyValueSampling', 'InputXGradient'. Defaults to 'IntegratedGradients'.
+            df (pandas, polars or spark DataFrame, optional): DataFrame with columns [`unique_id`, `ds`, `y`] and exogenous variables.
+            If a DataFrame is passed, it is used to generate forecasts. Defaults to None.
+            static_df (pandas, polars or spark DataFrame, optional): DataFrame with columns [`unique_id`] and static exogenous. Defaults to None.
+            futr_df (pandas, polars or spark DataFrame, optional): DataFrame with [`unique_id`, `ds`] columns and `df`'s future exogenous. Defaults to None.
+            verbose (bool): Print processing steps. Defaults to False.
+            engine (spark session): Distributed engine for inference. Only used if df is a spark dataframe or if fit was called on a spark dataframe.
+            level (list of ints or floats, optional): Confidence levels between 0 and 100. Defaults to None.
+            quantiles (list of floats, optional): Alternative to level, target quantiles to predict. Defaults to None.
+            data_kwargs (kwargs): Extra arguments to be passed to the dataset within each model.
+
+        Returns:
+            fcsts_df (pandas or polars DataFrame): DataFrame with insample `models` columns for point predictions and probabilistic
+            predictions for all fitted `models`.
+            explanations (dict): Dictionary of explanations for the predictions.
+        """
+        warnings.warn("This function is beta and subject to change.")
+
+        if horizons is None:
+            horizons = list(range(self.h))
+        elif not horizons or len(horizons) > self.h or any(h < 0 or h >= self.h for h in horizons):
+            raise ValueError(
+                f"Invalid indices. Make sure to select horizon steps within {list(range(self.h))} or set it to None to explain all horizon steps"
+            )
+
+        try:
+            import captum
+        except ImportError:
+            raise ImportError(
+                "Captum is not installed. Please install it with `pip install captum`."
+            )
+        if not hasattr(captum.attr, explainer):
+            raise ValueError(f"Explainer {explainer} is not available in captum.")
+        if explainer not in ExplainerEnum.AllExplainers:
+            all_explainers = ", ".join(ExplainerEnum.AllExplainers)
+            raise ValueError(
+                f"Explainer {explainer} is not supported. Supported explainers are: {all_explainers}."
+            )
+
+        models_to_explain = []
+        skipped_models = []
+        
+        for model in self.models:
+            model_name = model.hparams.alias if hasattr(model.hparams, 'alias') and model.hparams.alias else model.__class__.__name__
+            
+            # Check for multivariate models
+            if model.MULTIVARIATE:
+                skipped_models.append(model_name)
+                if verbose:
+                    warnings.warn(f"Skipping {model_name}: Explanations are not currently supported for multivariate models.")
+                continue
+                
+            # Check for DistributionLoss
+            if hasattr(model.loss, 'is_distribution_output') and model.loss.is_distribution_output:
+                loss_name = model.loss.__class__.__name__
+                skipped_models.append(model_name)
+                if verbose:
+                    warnings.warn(
+                        f"Skipping {model_name}: Explanations are not currently supported for {model_name} with {loss_name}. "
+                        f"Please use a point loss (MAE, MSE, etc.) or a non-parametric probabilistic loss (MQLoss, IQLoss, etc.). "
+                        f"Point losses and non-parametric probabilistic losses are listed here: "
+                        f"https://nixtlaverse.nixtla.io/neuralforecast/docs/capabilities/objectives.html"
+                    )
+                continue
+                
+            # Check for recurrent models with incompatible configurations
+            if model.RECURRENT:
+                # Check for IntegratedGradients incompatibility
+                if explainer == "IntegratedGradients":
+                    skipped_models.append(model_name)
+                    if verbose:
+                        warnings.warn(
+                            f"Skipping {model_name}: IntegratedGradients is not compatible with recurrent models. "
+                            f"Either set recurrent=False when initializing the model, or use a different explainer."
+                        )
+                    continue
+                
+                # Check for InputXGradient + GPU incompatibility (cudnn error)
+                if explainer == "InputXGradient":
+                    using_gpu = False
+                    if hasattr(model, 'trainer_kwargs'):
+                        accelerator = model.trainer_kwargs.get('accelerator', 'auto')
+                        using_gpu = (accelerator == 'gpu' or 
+                                    (accelerator == 'auto' and torch.cuda.is_available()))
+                    elif torch.cuda.is_available():
+                        using_gpu = True
+                    
+                    if using_gpu:
+                        skipped_models.append(model_name)
+                        if verbose:
+                            warnings.warn(
+                                f"Skipping {model_name}: InputXGradient with recurrent models on GPU causes cudnn errors. "
+                                f"To fix this, either: 1) Set recurrent=False when initializing the model, "
+                                f"2) Use ShapleyValueSampling instead, or "
+                                f"3) Set accelerator='cpu' and devices=1 when initializing the model."
+                            )
+                        continue
+                
+            models_to_explain.append(model)
+        
+        if not models_to_explain:
+            # Build a more specific error message based on what was skipped
+            error_msg = "No models support explanations with the current configuration. "
+            if any(model.RECURRENT for model in self.models) and explainer == ExplainerEnum.IntegratedGradients:
+                error_msg += (
+                    f"{ExplainerEnum.IntegratedGradients} is not compatible with recurrent models. "
+                    "Either set recurrent=False or use a different explainer. "
+                )
+            error_msg += (
+                f"The following models were skipped: {', '.join(skipped_models)}. "
+            )
+            raise ValueError(error_msg)
+        
+        # Determine minimum outputs across all models
+        min_outputs = min(
+            model.loss.outputsize_multiplier if hasattr(model.loss, 'outputsize_multiplier')
+            else len(model.loss.output_names) if hasattr(model.loss, 'output_names')
+            else 1
+            for model in models_to_explain
+        )
+
+        # Validate outputs
+        if outputs is None:
+            outputs = [0]  # Default to first output
+        elif not outputs or any(o < 0 or o >= min_outputs for o in outputs):
+            raise ValueError(
+                f"Invalid output indices. Based on the models being explained, valid outputs are in {list(range(min_outputs))}. "
+                f"You must set valid output indices for all models, which is the minimum number of ouputs amongst all models. "
+                f"You can always set outputs=None to default to [0] (first output)."
+            )
+        
+        # Temporarily replace self.models with only explainable models
+        original_models = self.models
+        self.models = models_to_explain
+
+        explainer_config = {
+            "explainer": captum.attr.__dict__[explainer],
+            "horizons": horizons,
+            "output_index": outputs,
+        }
+
+        try:
+            fcsts_df = self.predict(
+                df=df,
+                static_df=static_df,
+                futr_df=futr_df,
+                verbose=verbose,
+                engine=engine,
+                level=level,
+                quantiles=quantiles,
+                explainer_config=explainer_config,
+                **data_kwargs,
+            )
+        finally:
+            # Restore original models
+            self.models = original_models
+
+        if self.scalers_:
+            warnings.warn(
+                "You used a global scaler, so explanations will be scaled. Additivity may not hold, but the relative importance is still correct. "
+                "To have explanations in the same scale as the original data, use window scaling by setting scaler_type when initializing a model instead of local_scaler_type in the NeuralForecast object. "
+                "Read more on the two types of temporal scaling here: https://nixtlaverse.nixtla.io/neuralforecast/docs/capabilities/time_series_scaling.html "
+            )
+
+        # Collect explanations from models that were explained
+        explanations = {}
+        for model in models_to_explain:
+            if hasattr(model, "explanations") and model.explanations is not None:
+                model_name = model.hparams.alias if hasattr(model.hparams, 'alias') and model.hparams.alias else model.__class__.__name__
+                explanations[model_name] = {
+                    "insample": model.explanations["insample_explanations"],           # [batch_size, horizon, n_series, n_output, input_size, 2 (y attribution, mask attribution)]
+                    "futr_exog": model.explanations["futr_exog_explanations"],         # [batch_size, horizon, n_series, n_output, input_size+horizon, n_futr_features]
+                    "hist_exog": model.explanations["hist_exog_explanations"],         # [batch_size, horizon, n_series, n_output, input_size, n_hist_features]
+                    "stat_exog": model.explanations["stat_exog_explanations"],         # [batch_size, horizon, n_series, n_output, n_static_features]
+                    "baseline_predictions": model.explanations["baseline_predictions"] # [batch_size, horizon, n_series, n_output]
+                }
+                # Delete explanations attribute once extracted
+                delattr(model, "explanations")
+
+        return fcsts_df, explanations
 
     def _reset_models(self):
         self.models = [deepcopy(model) for model in self.models_init]
@@ -952,6 +1199,7 @@ class NeuralForecast:
         id_col: str,
         time_col: str,
         target_col: str,
+        h: int,
         **data_kwargs,
     ) -> DataFrame:
         if (df is None) and not (hasattr(self, "dataset")):
@@ -982,7 +1230,7 @@ class NeuralForecast:
             times=self.ds,
             uids=self.uids,
             indptr=self.dataset.indptr,
-            h=self.h,
+            h=h,
             test_size=test_size,
             step_size=step_size,
             id_col=id_col,
@@ -1001,9 +1249,8 @@ class NeuralForecast:
 
             model.fit(dataset=self.dataset, val_size=val_size, test_size=test_size)
             model_fcsts = model.predict(
-                self.dataset, step_size=step_size, **data_kwargs
+                self.dataset, step_size=step_size, h=h, **data_kwargs
             )
-
             # Append predictions in memory placeholder
             fcsts_list.append(model_fcsts)
 
@@ -1015,8 +1262,8 @@ class NeuralForecast:
         if self.scalers_ or needs_trim:
             indptr = np.arange(
                 0,
-                n_windows * self.h * (self.dataset.n_groups + 1),
-                n_windows * self.h,
+                n_windows * h * (self.dataset.n_groups + 1),
+                n_windows * h,
                 dtype=np.int32,
             )
             if self.scalers_:
@@ -1067,6 +1314,7 @@ class NeuralForecast:
         prediction_intervals: Optional[PredictionIntervals] = None,
         level: Optional[List[Union[int, float]]] = None,
         quantiles: Optional[List[float]] = None,
+        h: Optional[int] = None,
         **data_kwargs,
     ) -> DataFrame:
         """Temporal Cross-Validation with core.NeuralForecast.
@@ -1093,16 +1341,47 @@ class NeuralForecast:
             prediction_intervals (PredictionIntervals, optional): Configuration to calibrate prediction intervals (Conformal Prediction). Defaults to None.
             level (list of ints or floats, optional): Confidence levels between 0 and 100. Defaults to None.
             quantiles (list of floats, optional): Alternative to level, target quantiles to predict. Defaults to None.
+            h (int, optional): Forecasting horizon. If None, uses the horizon of the fitted models. Defaults to None.
             data_kwargs (kwargs): Extra arguments to be passed to the dataset within each model.
 
         Returns:
             fcsts_df (pandas or polars DataFrame): DataFrame with insample `models` columns for point predictions and probabilistic
                 predictions for all fitted `models`.
         """
-        h = self.h
+        if h is not None:
+            if h > self.h:
+                # if only cross_validation called without fit() called first, prediction_intervals
+                # attribute is not defined
+                if getattr(self, "prediction_intervals", None) is not None:
+                    raise ValueError(
+                        f"The specified horizon h={h} is larger than the horizon of the fitted models: {self.h}. "
+                        "Forecast with prediction intervals is not supported."
+                    )
+
+                for model in self.models:
+                    if model.hist_exog_list:
+                        raise NotImplementedError(
+                            f"Model {model} has historic exogenous features, "
+                            "which is not compatible with setting a larger horizon during cross-validation."
+                        )
+                # Refit is not supported with cross-validation on longer horizons than the trained horizon
+                if not refit:
+                    raise ValueError(
+                        f"The specified horizon h={h} is larger than the horizon of the fitted models: {self.h}. "
+                        "Set refit=True in this setting."
+                    )
+            elif h < self.h:
+                raise ValueError(
+                    f"The specified horizon h={h} must be greater than the horizon of the fitted models: {self.h}."
+                )
+            else:
+                h = self.h
+        else:
+            h = self.h
+
         if n_windows is None and test_size is None:
             raise Exception("you must define `n_windows` or `test_size`.")
-        if test_size is None:
+        if test_size is None and h is not None:
             test_size = h + step_size * (n_windows - 1)
         elif n_windows is None:
             if (test_size - h) % step_size:
@@ -1142,6 +1421,7 @@ class NeuralForecast:
                 id_col=id_col,
                 time_col=time_col,
                 target_col=target_col,
+                h=h,
                 **data_kwargs,
             )
         if df is None:
@@ -1150,7 +1430,7 @@ class NeuralForecast:
         splits = ufp.backtest_splits(
             df,
             n_windows=n_windows,
-            h=self.h,
+            h=h,
             id_col=id_col,
             time_col=time_col,
             freq=self.freq,
@@ -1187,6 +1467,7 @@ class NeuralForecast:
                 verbose=verbose,
                 level=level,
                 quantiles=quantiles,
+                h=h,
                 **data_kwargs,
             )
             preds = ufp.join(preds, cutoffs, on=id_col, how="left")
@@ -1337,6 +1618,7 @@ class NeuralForecast:
                 level_=level_,
                 has_level=has_level,
                 step_size=step_size,
+                h=None,
             )
             fcst_list.append(fcsts)
 
@@ -1653,6 +1935,7 @@ class NeuralForecast:
         self,
         dataset: TimeSeriesDataset,
         uids: Series,
+        h: Union[int, None],
         quantiles_: Optional[List[float]] = None,
         level_: Optional[List[Union[int, float]]] = None,
         has_level: Optional[bool] = False,
@@ -1663,7 +1946,9 @@ class NeuralForecast:
         count_names = {"model": 0}
         for model in self.models:
             old_test_size = model.get_test_size()
-            model.set_test_size(self.h)  # To predict h steps ahead
+            model.set_test_size(
+                h if h is not None else self.h
+            )  # To predict h steps ahead
 
             # Increment model name if the same model is used more than once
             model_name = repr(model)
@@ -1680,7 +1965,7 @@ class NeuralForecast:
                 and callable(model.loss.update_quantile)
             ):
                 model_fcsts = model.predict(
-                    dataset=dataset, quantiles=quantiles_, **data_kwargs
+                    dataset=dataset, quantiles=quantiles_, h=h, **data_kwargs
                 )
                 fcsts_list.append(model_fcsts)
                 col_names = []
@@ -1721,7 +2006,7 @@ class NeuralForecast:
                 fcsts_list_iqloss = []
                 for i, quantile in enumerate(quantiles_iqloss):
                     model_fcsts = model.predict(
-                        dataset=dataset, quantiles=[quantile], **data_kwargs
+                        dataset=dataset, quantiles=[quantile], h=h, **data_kwargs
                     )
                     fcsts_list_iqloss.append(model_fcsts)
                 fcsts_iqloss = np.concatenate(fcsts_list_iqloss, axis=-1)
@@ -1744,7 +2029,7 @@ class NeuralForecast:
                         " You then must set `prediction_intervals` during fit to use level or quantiles during predict."
                     )
                 model_fcsts = model.predict(
-                    dataset=dataset, quantiles=quantiles_, **data_kwargs
+                    dataset=dataset, quantiles=quantiles_, h=h, **data_kwargs
                 )
                 prediction_interval_method = get_prediction_interval_method(
                     self.prediction_intervals.method
@@ -1763,7 +2048,7 @@ class NeuralForecast:
                 cols.extend([model_name] + out_cols)
             # base case: quantiles or levels are not supported or provided as arguments
             else:
-                model_fcsts = model.predict(dataset=dataset, **data_kwargs)
+                model_fcsts = model.predict(dataset=dataset, h=h, **data_kwargs)
                 fcsts_list.append(model_fcsts)
                 cols.extend(model_name + n for n in model.loss.output_names)
             model.set_test_size(old_test_size)  # Set back to original value
