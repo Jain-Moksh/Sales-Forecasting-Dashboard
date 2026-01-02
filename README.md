@@ -1,4 +1,4 @@
-# Nixtla 
+# Sales Forecasting Dashboard — Moksh Jain
 
 [![Tweet](https://img.shields.io/twitter/url/http/shields.io.svg?style=social)](https://twitter.com/intent/tweet?text=Statistical%20Forecasting%20Algorithms%20by%20Nixtla%20&url=https://github.com/Nixtla/neuralforecast&via=nixtlainc&hashtags=StatisticalModels,TimeSeries,Forecasting)
 [![Slack](https://img.shields.io/badge/Slack-4A154B?&logo=slack&logoColor=white)](https://join.slack.com/t/nixtlacommunity/shared_invite/zt-1pmhan9j5-F54XR20edHk0UtYAPcW4KQ)
@@ -14,11 +14,15 @@
 [![conda-nixtla](https://img.shields.io/conda/vn/conda-forge/neuralforecast?color=seagreen&label=conda)](https://anaconda.org/conda-forge/neuralforecast)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/Nixtla/neuralforecast/blob/main/LICENSE)
 [![docs](https://img.shields.io/website-up-down-green-red/http/nixtla.github.io/neuralforecast.svg?label=docs)](https://nixtla.github.io/neuralforecast/)
+
 <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
+
 [![All Contributors](https://img.shields.io/badge/all_contributors-11-orange.svg?style=flat-square)](#contributors-)
+
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 
 **NeuralForecast** offers a large collection of neural forecasting models focusing on their performance, usability, and robustness. The models range from classic networks like RNNs to the latest transformers: `MLP`, `LSTM`, `GRU`, `RNN`, `TCN`, `TimesNet`, `BiTCN`, `DeepAR`, `NBEATS`, `NBEATSx`, `NHITS`, `TiDE`, `DeepNPTS`, `TSMixer`, `TSMixerx`, `MLPMultivariate`, `DLinear`, `NLinear`, `TFT`, `Informer`, `AutoFormer`, `FedFormer`, `PatchTST`, `iTransformer`, `StemGNN`, and `TimeLLM`.
+
 </div>
 
 ## Installation
@@ -65,22 +69,22 @@ Unfortunately, available implementations and published research are yet to reali
 
 ## Features
 
-* Fast and accurate implementations of more than 30 state-of-the-art models. See the entire [collection here](https://nixtlaverse.nixtla.io/neuralforecast/docs/capabilities/overview.html).
-* Support for exogenous variables and static covariates.
-* Interpretability methods for trend, seasonality and exogenous components.
-* Probabilistic Forecasting with adapters for quantile losses and parametric distributions.
-* Train and Evaluation Losses with scale-dependent, percentage and scale independent errors, and parametric likelihoods.
-* Automatic Model Selection with distributed automatic hyperparameter tuning.
-* Familiar sklearn syntax: `.fit` and `.predict`.
+- Fast and accurate implementations of more than 30 state-of-the-art models. See the entire [collection here](https://nixtlaverse.nixtla.io/neuralforecast/docs/capabilities/overview.html).
+- Support for exogenous variables and static covariates.
+- Interpretability methods for trend, seasonality and exogenous components.
+- Probabilistic Forecasting with adapters for quantile losses and parametric distributions.
+- Train and Evaluation Losses with scale-dependent, percentage and scale independent errors, and parametric likelihoods.
+- Automatic Model Selection with distributed automatic hyperparameter tuning.
+- Familiar sklearn syntax: `.fit` and `.predict`.
 
 ## Highlights
 
-* Official `NHITS` implementation, published at AAAI 2023. See [paper](https://ojs.aaai.org/index.php/AAAI/article/view/25854) and [experiments](https://github.com/Nixtla/neuralforecast/tree/main/experiments).
-* Official `NBEATSx` implementation, published at the International Journal of Forecasting. See [paper](https://www.sciencedirect.com/science/article/pii/S0169207022000413).
-* Unified with`StatsForecast`, `MLForecast`, and `HierarchicalForecast` interface `NeuralForecast().fit(Y_df).predict()`, inputs and outputs.
-* Built-in integrations with `utilsforecast` and `coreforecast` for visualization and data-wrangling efficient methods.
-* Integrations with `Ray` and `Optuna` for automatic hyperparameter optimization.
-* Predict with little to no history using Transfer learning. Check the experiments [here](https://github.com/Nixtla/transfer-learning-time-series).
+- Official `NHITS` implementation, published at AAAI 2023. See [paper](https://ojs.aaai.org/index.php/AAAI/article/view/25854) and [experiments](https://github.com/Nixtla/neuralforecast/tree/main/experiments).
+- Official `NBEATSx` implementation, published at the International Journal of Forecasting. See [paper](https://www.sciencedirect.com/science/article/pii/S0169207022000413).
+- Unified with`StatsForecast`, `MLForecast`, and `HierarchicalForecast` interface `NeuralForecast().fit(Y_df).predict()`, inputs and outputs.
+- Built-in integrations with `utilsforecast` and `coreforecast` for visualization and data-wrangling efficient methods.
+- Integrations with `Ray` and `Optuna` for automatic hyperparameter optimization.
+- Predict with little to no history using Transfer learning. Check the experiments [here](https://github.com/Nixtla/transfer-learning-time-series).
 
 Missing something? Please open an issue or write us in [![Slack](https://img.shields.io/badge/Slack-4A154B?&logo=slack&logoColor=white)](https://join.slack.com/t/nixtlaworkspace/shared_invite/zt-135dssye9-fWTzMpv2WBthq8NK0Yvu6A)
 
@@ -114,25 +118,22 @@ This work is highly influenced by the fantastic work of previous contributors an
 
 ## 🙏 How to cite
 
-If you enjoy or benefit from using these Python implementations, a citation to the repository will be greatly appreciated.
+If you enjoy or benefit from using these Python implementations, please cite the original repository and mention Moksh Jain for project engineering and dashboard implementation.
 
 ```bibtex
 @misc{olivares2022library_neuralforecast,
-    author={Kin G. Olivares and
-            Cristian Challú and
-            Azul Garza and
-            Max Mergenthaler Canseco and
-            Artur Dubrawski},
-    title = {{NeuralForecast}: User friendly state-of-the-art neural forecasting models.},
-    year={2022},
-    howpublished={{PyCon} Salt Lake City, Utah, US 2022},
-    url={https://github.com/Nixtla/neuralforecast}
+  title = {{NeuralForecast}: User friendly state-of-the-art neural forecasting models.},
+  year={2022},
+  url={https://github.com/Nixtla/neuralforecast}
 }
+
+Project maintained and engineered by Moksh Jain
 ```
 
 ## Contributors ✨
 
 Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/docs/en/emoji-key)):
+
 <!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
 <!-- prettier-ignore-start -->
 <!-- markdownlint-disable -->
@@ -161,4 +162,8 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/d
 
 <!-- ALL-CONTRIBUTORS-LIST:END -->
 
-This project follows the [all-contributors](https://github.com/all-contributors/all-contributors) specification. Contributions of any kind welcome!
+---
+
+For questions or collaboration, contact me at [mokshjaindev@gmail.com](mailto:mokshjaindev@gmail.com).
+
+Copyright (c) 2026 Moksh Jain
